@@ -1,0 +1,416 @@
+# AWSTemplateFormatVersion: 2010-09-09
+# Description: >-
+# AWS CloudFormation Template that will deploy ressources used to backup and archives AWS entities.
+# **WARNING** You will be billed for the AWS resources used if you create a stack from this template.
+
+Parameters:
+  VPC:
+    Type: AWS::EC2::VPC::Id
+    Description: VPC Identifier
+  Subnet:
+    Type: AWS::EC2::Subnet::Id
+    Description: Subnet Identifier
+  # BatchSG:
+  #   Type: AWS::EC2::SecurityGroup::Id
+  #   Description: SecrurityGroup that will allow to communicate with the Database
+  EcrImageURI:
+    Description: The ECR image used by Fargate to backup and archive your files to S3
+    Type: String
+  EmailAlerts:
+    Description: The email address for the alerts
+    Type: String
+  S3BucketName:
+    Description: S3 Bucket where backups will be archived
+    Type: String
+
+Resources:
+  BatchSG:
+    Type: AWS::EC2::SecurityGroup    
+    Properties:
+      GroupDescription: "SG for Fargate Instances"            
+      GroupName: Batch-sg      
+      VpcId: !Ref VPC
+      SecurityGroupEgress:        
+        - IpProtocol: '-1'
+          CidrIp: 0.0.0.0/0
+          Description: Allow outbound traffic to anywhere
+  BatchSGIngress:
+    Type: AWS::EC2::SecurityGroupIngress    
+    Properties:
+      Description: Allow inbound traffic from itself
+      IpProtocol: '-1'
+      GroupId: !GetAtt BatchSG.GroupId
+      SourceSecurityGroupId: !Ref BatchSG
+
+
+  ColdArchivingInventoryTable:
+    Type: AWS::DynamoDB::Table
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      AttributeDefinitions:
+        - AttributeName: accountId
+          AttributeType: S
+        - AttributeName: FILE
+          AttributeType: S
+      BillingMode: PAY_PER_REQUEST
+      KeySchema:
+        - AttributeName: accountId
+          KeyType: HASH
+        - AttributeName: FILE
+          KeyType: RANGE
+      TableName: !Sub ${AWS::StackName}-inventory
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+
+  EFSFileSystemResource:
+    Type: AWS::EFS::FileSystem
+    Properties:
+      FileSystemTags:
+        - Key: Name
+          Value: EFSArchivingFileSystem
+      Encrypted: true
+      FileSystemPolicy:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: "Allow"
+            Action:
+              - "elasticfilesystem:ClientRootAccess"
+              - "elasticfilesystem:ClientWrite"
+              - "elasticfilesystem:ClientMount"
+            Principal:
+              AWS: !GetAtt BatchTaskExecutionRole.Arn
+
+  MountTargetResource1:
+    Type: AWS::EFS::MountTarget
+    Properties:
+      FileSystemId: !Ref EFSFileSystemResource
+      SubnetId: !Ref Subnet
+      SecurityGroups:
+        - !Ref BatchSG
+
+  BatchJobDefinition:
+    Type: AWS::Batch::JobDefinition
+    Properties:
+      Type: container
+      PlatformCapabilities:
+        - FARGATE
+      JobDefinitionName: cold_archiving_job
+      ContainerProperties:
+        Image: !Ref EcrImageURI
+        MountPoints:
+          - SourceVolume: efs-volume
+            ContainerPath: /mnt/efs
+            ReadOnly: false
+        Volumes:
+          - Name: efs-volume
+            EfsVolumeConfiguration:
+              FileSystemId: !Ref EFSFileSystemResource
+              RootDirectory: /
+              TransitEncryption: ENABLED
+              AuthorizationConfig:
+                Iam: ENABLED
+        ResourceRequirements:
+          - Value: 4
+            Type: VCPU
+          - Value: 8192
+            Type: MEMORY
+        JobRoleArn: !GetAtt BatchTaskExecutionRole.Arn
+        ExecutionRoleArn: !GetAtt BatchTaskExecutionRole.Arn
+        LogConfiguration:
+          LogDriver: awslogs
+          Options:
+            awslogs-group: !Ref BatchLogGroup
+            awslogs-region: !Ref AWS::Region
+            awslogs-stream-prefix: !Sub /${AWS::StackName}-logs
+        # The following is mandatory if fargate is to be deployed in a public subnet, but highly insecure.
+        # Keeping for testing purposes as this switch is undocumented at the time of writing
+        # NetworkConfiguration:
+        #   AssignPublicIp: ENABLED
+      RetryStrategy:
+        Attempts: 1
+
+  BatchJobQueue:
+    Type: AWS::Batch::JobQueue
+    Properties:
+      JobQueueName: cold_archiving_queue
+      Priority: 1
+      ComputeEnvironmentOrder:
+        - Order: 1
+          ComputeEnvironment: !Ref ComputeEnvironment
+
+  ComputeEnvironment:
+    Type: AWS::Batch::ComputeEnvironment
+    Properties:
+      Type: MANAGED
+      State: ENABLED
+      ComputeResources:
+        Type: Fargate
+        MaxvCpus: 12
+        Subnets:
+          - !Ref Subnet
+        SecurityGroupIds:
+          - !Ref BatchSG
+      ServiceRole: !GetAtt ServiceRole.Arn
+
+  ServiceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - batch.amazonaws.com
+                - lambda.amazonaws.com
+            Action:
+              - sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSBatchServiceRole
+
+  BatchLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub ${AWS::StackName}-awslogs
+      RetentionInDays: 7
+
+  BatchTaskExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: cold-archiving-taskexec-role
+      AssumeRolePolicyDocument:
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - ecs-tasks.amazonaws.com
+                - scheduler.amazonaws.com
+                - lambda.amazonaws.com
+            Action:
+              - sts:AssumeRole
+      Path: /
+      ManagedPolicyArns:
+        - "arn:aws:iam::aws:policy/service-role/AWSLambdaVPCAccessExecutionRole"
+        - "arn:aws:iam::aws:policy/AmazonEC2ContainerRegistryReadOnly"
+        - "arn:aws:iam::aws:policy/AmazonRDSReadOnlyAccess"
+        - "arn:aws:iam::aws:policy/service-role/AWSLambdaRole"
+                
+      Policies:
+        - PolicyName: cold-archiving-secretmanager-policy
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Effect: Allow
+                Action:
+                  - secretsmanager:GetSecretValue
+                Resource:
+                  - !Sub arn:${AWS::Partition}:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:cold-archiving/*
+        - PolicyName: !Sub ${AWS::StackName}-batch-policy
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Effect: Allow
+                Action:
+                  - batch:SubmitJob
+                Resource:
+                  - !Sub arn:${AWS::Partition}:batch:${AWS::Region}:${AWS::AccountId}:job-definition/cold_archiving_job
+                  - !Sub arn:${AWS::Partition}:batch:${AWS::Region}:${AWS::AccountId}:job-queue/cold_archiving_queue
+        - PolicyName: !Sub ${AWS::StackName}-ssm-parameters-policy
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Effect: Allow
+                Action:
+                  - ssm:GetParameter
+                  - ssm:GetParameters
+                  - ssm:GetParametersByPath
+                Resource:
+                  - !Sub arn:${AWS::Partition}:ssm:${AWS::Region}:${AWS::AccountId}:parameter/BatchJobDefinitionName
+                  - !Sub arn:${AWS::Partition}:ssm:${AWS::Region}:${AWS::AccountId}:parameter/BatchJobQueueName
+                  - !Sub arn:${AWS::Partition}:ssm:${AWS::Region}:${AWS::AccountId}:parameter/ColdArchivingInventoryTable
+                  - !Sub arn:${AWS::Partition}:ssm:${AWS::Region}:${AWS::AccountId}:parameter/EFSFileSystemId
+        - PolicyName: !Sub ${AWS::StackName}-ssm-policy
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Effect: Allow
+                Action:
+                  - ssm:GetParameter
+                  - ssm:GetParameters
+                  - ssm:GetParametersByPath
+                Resource:
+                  - !Sub arn:${AWS::Partition}:ssm:${AWS::Region}:${AWS::AccountId}:parameter/BatchJobDefinitionName
+                  - !Sub arn:${AWS::Partition}:ssm:${AWS::Region}:${AWS::AccountId}:parameter/BatchJobQueueName
+                  - !Sub arn:${AWS::Partition}:ssm:${AWS::Region}:${AWS::AccountId}:parameter/ColdArchivingInventoryTable
+        - PolicyName: !Sub ${AWS::StackName}-ecs-task-s3-policy
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:PutObject
+                  - s3:GetObject
+                  - s3:ListBucket
+                Resource: !Sub arn:${AWS::Partition}:s3:::${S3BucketName}/*
+        - PolicyName: !Sub ${AWS::StackName}-ecs-task-dynamo-policy
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Effect: Allow
+                Action:
+                  - dynamodb:PutItem
+                Resource: !Sub arn:${AWS::Partition}:dynamodb:${AWS::Region}:${AWS::AccountId}:table/${AWS::StackName}-inventory
+        - PolicyName: !Sub ${AWS::StackName}-sqs-policy
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Effect: Allow
+                Action:
+                  - sqs:SendMessage
+                  - sqs:SendMessageBatch
+                  - sqs:DeleteMessage
+                  - sqs:DeleteMessageBatch
+                  - sqs:ReceiveMessage
+                  - sqs:GetQueueAttributes
+                Resource: !Sub arn:${AWS::Partition}:sqs:${AWS::Region}:${AWS::AccountId}:${AWS::StackName}-*
+
+  SQSErrorQueue:
+    Type: AWS::SQS::Queue
+    UpdateReplacePolicy: Delete
+    Properties:
+      QueueName: !Sub ${AWS::StackName}-cold-archiving-error-queue
+      KmsMasterKeyId: alias/aws/sqs
+
+  SNSErrorTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub ${AWS::StackName}-errors-topic
+      KmsMasterKeyId: "alias/aws/sns"
+      Subscription:
+        - Endpoint: !Ref EmailAlerts
+          Protocol: email
+
+  MySNSTopicPolicy:
+    Type: AWS::SNS::TopicPolicy
+    Properties:
+      PolicyDocument:
+        Id: MyTopicPolicy
+        Version: "2012-10-17"
+        Statement:
+          - Sid: AllowPublish
+            Effect: Allow
+            Principal:
+              Service:
+                - events.amazonaws.com
+            Action: sns:Publish
+            Resource:
+              - !Sub ${AWS::Region}:${AWS::AccountId}:/${AWS::StackName}-errors-topic
+      Topics:
+        - !Ref SNSErrorTopic
+
+  BasicParameter:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: ColdArchivingInventoryTable
+      Type: String
+      Value: !Ref ColdArchivingInventoryTable
+      Description: SSM Parameter for storing DynamoDB table name
+
+  EfsFSIdParameter:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: EFSFileSystemId
+      Type: String
+      Value: !Ref EFSFileSystemResource
+      Description: SSM Parameter for storing EFS file system ID
+
+  BatchJobDefinitionParameter:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: BatchJobDefinitionName
+      Type: String
+      Value: !Ref BatchJobDefinition
+      Description: SQS Queue to store errors
+
+  BatchJobQueueParameter:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: BatchJobQueueName
+      Type: String
+      Value: !Ref BatchJobQueue
+      Description: SQS Queue to store errors
+
+  EventRuleBatchFailure:
+    Type: AWS::Events::Rule
+    Properties:
+      EventBusName: default
+      EventPattern:
+        source:
+          - aws.batch
+        detail-type:
+          - Batch Job State Change
+        detail:
+          status:
+            - FAILED
+      Name: Batch-Failure
+      State: ENABLED
+      Targets:
+        - Id: SNSErrorTopic
+          Arn: !Ref SNSErrorTopic
+          InputTransformer:
+            InputPathsMap:
+              Event: $.detail-type
+              Reason: $.detail.statusReason
+              Status: $.detail.status
+            InputTemplate: |
+              "Backup/Archiving Error: Detected Event: Backup <Event> is in <Status> State. Reason: <Reason>. See CloudWatch logs for more details."
+
+  ColdArchivingLambdaFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      DeadLetterConfig:
+        TargetArn: !GetAtt SQSErrorQueue.Arn
+      Description: Python Lambda Function
+      Handler: lambda_function.lambda_handler
+      ReservedConcurrentExecutions: 16
+      Runtime: python3.12
+      Role: !GetAtt BatchTaskExecutionRole.Arn
+      Timeout: 60
+      Code:
+        S3Bucket: !Ref S3BucketName
+        S3Key: cold_archiving_lambda_func.zip
+      VpcConfig:
+        SecurityGroupIds:
+          - !Ref BatchSG
+        SubnetIds:
+          - !Ref Subnet
+
+Outputs:
+  BatchTaskExecutionRole:
+    Description: AWS Batch Task Service Role
+    Value: !Ref BatchTaskExecutionRole
+  ComputeEnvironmentArn:
+    Description: ARN of the Compute Environment
+    Value: !Ref ComputeEnvironment
+  EcrImageURI:
+    Description: ECR Image URI
+    Value: !Ref EcrImageURI
+  EFSFileSystemId:
+    Description: EFS File System Id
+    Value: !Ref EFSFileSystemResource
+  FargateSubnet:
+    Description: Subnet Identifier
+    Value: !Ref Subnet
+  InventoryTable:
+    Description: DynamoDB table containing inventory of archived files
+    Value: !Ref ColdArchivingInventoryTable
+  JobQueueArn:
+    Description: Batch Job Queue ARN
+    Value: !Ref BatchJobQueue
+  JobDefinitionArn:
+    Description: Batch Job Definition ARN
+    Value: !Ref BatchJobDefinition
+  VPC:
+    Description: VPC Identifier
+    Value: !Ref VPC
